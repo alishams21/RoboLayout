@@ -8,7 +8,7 @@ This repository extends [LayoutVLM](https://github.com/StanfordVL/layoutvlm) wit
 RoboLayout comprises three main layers. Orchestration: The central orchestrator responsible for coordinating group-ings, rendering and other cognitive processes of the solver and sandbox. Sandbox: Translates constraints into feasible scene layouts. Solver: optimizer based on hard and soft constraints for spatial arrangements and refinement of the final optimized scene. Following shows the architecture diagram:
 
 <p align="center">
-  <img src="figures/architecture.png" alt="architecture diagram" width="50%">
+  <img src="figures/architecture.png" alt="architecture diagram" >
 </p>
 
 
