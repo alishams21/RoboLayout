@@ -14,6 +14,12 @@ def parse_args():
     parser.add_argument("--model", help="Model to use for layout generation", default="gpt-4")
     parser.add_argument("--openai_api_key", help="OpenAI API key", required=True)
     parser.add_argument("--asset_dir", help="Directory to load assets from.", default="./objaverse_processed")
+    parser.add_argument(
+        "--robot_radius",
+        type=float,
+        default=0.3,
+        help="Radius (in meters) of the virtual robot used for reachability constraints.",
+    )
     return parser.parse_args()
 
 def prepare_task_assets(task, asset_dir):
@@ -100,6 +106,9 @@ def main():
     # Load scene configuration
     with open(args.scene_json_file, 'r') as f:
         scene_config = json.load(f)
+
+    # Attach robot reachability configuration
+    scene_config["robot_radius"] = float(args.robot_radius)
     
     # Prepare assets
     scene_config = prepare_task_assets(scene_config, args.asset_dir)

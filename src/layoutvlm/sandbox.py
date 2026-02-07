@@ -3,8 +3,55 @@ import torch
 import re
 import numpy as np
 import os
+import sys
 from typing import Any
 from .grad_solver import GradSolver
+
+# ANSI colors for constraint log (conflict=red, no conflict=green)
+RED = "\033[91m"
+GREEN = "\033[92m"
+RESET = "\033[0m"
+
+
+def _is_conflict_line(line: str) -> bool:
+    """True if this log line indicates a rejected/conflict constraint."""
+    line = line.strip()
+    if not line:
+        return False
+    return (
+        "==> (rejected)" in line
+        or "==> (reject " in line
+        or " is already specified" in line
+        or "conflicts with existing" in line
+    )
+
+
+def _use_color() -> bool:
+    """Use ANSI colors only when stdout is a TTY."""
+    return hasattr(sys.stdout, "isatty") and sys.stdout.isatty()
+
+
+def _red(s: str) -> str:
+    return f"{RED}{s}{RESET}" if _use_color() else s
+
+
+def _print_constraint_log(existing_constraint_str: str, new_constraint_str: str) -> None:
+    """Print constraint log to console with green for accepted and red for conflicts."""
+    use_color = _use_color()
+    green = GREEN if use_color else ""
+    red = RED if use_color else ""
+    reset = RESET if use_color else ""
+
+    print("\n--- Existing constraints (no conflict) ---")
+    for line in existing_constraint_str.strip().splitlines():
+        print(f"{green}{line}{reset}")
+
+    print("\n--- New constraints ---")
+    for line in new_constraint_str.strip().splitlines():
+        if _is_conflict_line(line):
+            print(f"{red}{line}{reset}")
+        else:
+            print(f"{green}{line}{reset}")
 from .constraints import Constraint
 from .constraints import align_with, on_top_of
 from .constraints import distance_constraint
@@ -13,17 +60,20 @@ from .constraints import against_wall
 from utils.placement_utils import get_random_placement
 from .scene import AssetInstance, Wall
 from .device_utils import get_device_with_index, to_device
+from . import loss_utils
 
 
 
 
 class SandBoxEnv:
-    def __init__(self, task, mode="default", save_dir=None):
+    def __init__(self, task, mode="default", save_dir=None, robot_radius=None):
         self.task = task
         self.mode = mode
         self.boundary = task["boundary"]["floor_vertices"]
         self.save_dir = save_dir
-        self.grad_solver = GradSolver(self.boundary)
+        # Radius of the virtual robot used for reachability constraints
+        self.robot_radius = robot_radius
+        self.grad_solver = GradSolver(self.boundary, robot_radius=self.robot_radius)
         self.local_vars = {}
         self.all_code = ""
         self.all_constraints = []
@@ -228,14 +278,14 @@ class SandBoxEnv:
 
             elif constraint.constraint_name == "distance_constraint":
                 if existing_constraints_count > 2:
-                    print(f"constraint {constraint.constraint_name} with instance_ids {instance_ids} is already specified")
+                    print(_red(f"constraint {constraint.constraint_name} with instance_ids {instance_ids} is already specified"))
                     new_constraint_str += f"==> (rejected) solver.{constraint.constraint_name}({instance_ids[0]}, {instance_ids[1]}, {constraint.params['min_distance']}, {constraint.params['max_distance']})\n"
                     continue
                 if solver_assets[instance_ids[0]].onCeiling or solver_assets[instance_ids[1]].onCeiling:
                     new_constraint_str += f"==> (reject distance constraints with Ceiling assets) solver.{constraint.constraint_name}({instance_ids[0]}, {instance_ids[1]})\n"
                     continue
                 if solver_assets[instance_ids[0]].size is None or solver_assets[instance_ids[1]].size is None:
-                    print(f"constraint {constraint.constraint_name} with instance_ids {instance_ids} is not ")
+                    print(_red(f"constraint {constraint.constraint_name} with instance_ids {instance_ids} is not (rejected as distance to wall not supported)"))
                     new_constraint_str += f"==> (rejected as distance to wall not supported) solver.{constraint.constraint_name}({instance_ids[0]}, {instance_ids[1]}, {constraint.params['min_distance']}, {constraint.params['max_distance']})\n"
                     continue
                 # Calculate the distance between two assets using self.local_vars
@@ -264,7 +314,7 @@ class SandBoxEnv:
                     for c in self.all_constraints + filtered_new_constraints
                 )
                 if has_existing_orientation_constraint:
-                    print(f"constraint {constraint.constraint_name} with instance_ids {instance_ids} conflicts with existing constraint")
+                    print(_red(f"constraint {constraint.constraint_name} with instance_ids {instance_ids} conflicts with existing constraint"))
                     new_constraint_str += f"==> (rejected) solver.{constraint.constraint_name}({instance_ids[0]}, {instance_ids[1]}, {constraint.params['angle']})\n"
                     continue
 
@@ -278,7 +328,7 @@ class SandBoxEnv:
                     for c in self.all_constraints + filtered_new_constraints
                 )
                 if has_existing_orientation_constraint:
-                    print(f"constraint {constraint.constraint_name} with instance_ids {instance_ids} conflicts with existing constraint")
+                    print(_red(f"constraint {constraint.constraint_name} with instance_ids {instance_ids} conflicts with existing constraint"))
                     new_constraint_str += f"==> (rejected) solver.{constraint.constraint_name}({instance_ids[0]}, {instance_ids[1]}, {constraint.params['angle']})\n"
                     continue
 
@@ -440,6 +490,7 @@ class SandBoxEnv:
 
         if "no_self_consistency" not in self.mode:
             new_constraints, [existing_constraint_str, new_constraint_str] = self.self_consistency_filtering(solver_assets, new_constraints)
+            _print_constraint_log(existing_constraint_str, new_constraint_str)
             with open(f"{save_dir}/new_constraints.txt", "w") as f:
                 f.write(existing_constraint_str)
                 f.write("\n=================================\n")
@@ -454,12 +505,15 @@ class SandBoxEnv:
                 solver_code += f"{asset_var_name}[{instance_idx}].optimize = 2\n"
         else:
             ### use constraints to further optimize the pose of assets
+            loss_dir = loss_utils.get_loss_dir(save_dir)
             results = self.grad_solver.optimize(
                 assets=solver_assets,
                 existing_constraints=self.all_constraints,
                 new_constraints=new_constraints,
                 temp_dir=f"{save_dir}/temp_{self.solver_step}",
-                output_gif_path=f"{save_dir}/out.gif"
+                output_gif_path=f"{save_dir}/out.gif",
+                loss_dir=loss_dir,
+                loss_filename_suffix=str(self.solver_step),
             )
             ##########################################################################
             ### merge these results back with self.local_vars

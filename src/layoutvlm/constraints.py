@@ -19,6 +19,9 @@ except ImportError as e:
         f"Original error: {e}"
     )
 
+# Only print the "no CUDA / oriented IoU fallback" warning once per process
+_oriented_iou_fallback_warned = False
+
 
 class Constraint:
     def __init__(self, constraint_name, constraint_func, description="", **params):
@@ -228,9 +231,12 @@ def bbox_overlap_loss(assets: list, skipped_asset_pairs: list=[], only_consider_
             warnings.warn(f"Error using oriented_iou_loss: {e}. Using simplified fallback.")
             giou_loss, iou = _cpu_fallback_giou(corners1, corners2, area1, area2, device)
     else:
-        # Fallback: use a simplified overlap calculation
-        print("WARNING: No CUDA device available, skipping important oriented IoU loss function. "
-              "Results may be less accurate.")
+        # Fallback: use a simplified overlap calculation (warn only once)
+        global _oriented_iou_fallback_warned
+        if not _oriented_iou_fallback_warned:
+            _oriented_iou_fallback_warned = True
+            print("WARNING: No CUDA device available, skipping important oriented IoU loss function. "
+                  "Results may be less accurate.")
         giou_loss, iou = _cpu_fallback_giou(corners1, corners2, area1, area2, device)
 
     if consider_z_axis:

@@ -470,7 +470,12 @@ class LayoutVLM:
         """
         task = original_task.copy()
         #### initialize the sandbox and initialize all the variables
-        self.sandbox = SandBoxEnv(task, mode=self.mode, save_dir=self.save_dir)
+        self.sandbox = SandBoxEnv(
+            task,
+            mode=self.mode,
+            save_dir=self.save_dir,
+            robot_radius=task.get("robot_radius", None),
+        )
         task_program = self.get_task_program(list(task["assets"].keys()), task)
         self.sandbox.execute_code(base_prompt.CODE_FOR_SANDBOX + "\n" + task_program)
         self.sandbox.assign_instance_ids()

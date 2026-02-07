@@ -16,11 +16,13 @@ from .constraints import bbox_overlap_loss, Constraint, against_wall, align_with
 import re
 from scipy.optimize import NonlinearConstraint
 from .device_utils import get_device_with_index, to_device
+from . import loss_utils
+from .cleanup_furniture import run_cleanup_step
 
 
 
 class GradSolver:
-    def __init__(self, boundary, solver_type="default"):
+    def __init__(self, boundary, solver_type="default", robot_radius=None):
         """
         grad solver only maintains the following states:
         - self.boundary: the boundary of the room
@@ -34,8 +36,13 @@ class GradSolver:
             self.device = 'cpu'
         self.boundary = boundary
         self.solver_type = solver_type
+        # Radius of the virtual robot used for reachability constraints.
+        # If None or <= 0, reachability loss is disabled.
+        self.robot_radius = robot_radius
         self.on_top_of_assets = []
-    
+        # When True, constraint terms that do not require gradients are allowed (e.g. during cleanup when some assets are frozen).
+        self.allow_nograd_constraints = False
+
     def is_fixture(self, instance_id):
         return instance_id.startswith('walls') or instance_id.startswith('fixed_point') or instance_id == "room_0"
 
@@ -129,11 +136,12 @@ class GradSolver:
             total_loss = 0
             for constraint, instance_ids in existing_constraints:
                 assets = [self.solver_assets[instance_id] for instance_id in instance_ids]
-                for asset in assets:
-                    if isinstance(asset, torch.Tensor) and not asset.requires_grad:
-                        raise RuntimeError(f"Asset tensor {asset} does not require gradients.")
-                if not constraint.evaluate(assets).requires_grad:
-                    raise RuntimeError("asset tensor does not require gradients.")
+                if not self.allow_nograd_constraints:
+                    for asset in assets:
+                        if isinstance(asset, torch.Tensor) and not asset.requires_grad:
+                            raise RuntimeError(f"Asset tensor {asset} does not require gradients.")
+                    if not constraint.evaluate(assets).requires_grad:
+                        raise RuntimeError("asset tensor does not require gradients.")
                 total_loss += 100 * constraint.evaluate(assets)
             return total_loss
 
@@ -142,11 +150,12 @@ class GradSolver:
             total_loss = 0
             for constraint, instance_ids in new_constraints:
                 assets = [self.solver_assets[instance_id] for instance_id in instance_ids]
-                for asset in assets:
-                    if isinstance(asset, torch.Tensor) and not asset.requires_grad:
-                        raise RuntimeError(f"Asset tensor {asset} does not require gradients.")
-                if not constraint.evaluate(assets).requires_grad:
-                    raise RuntimeError(f"Constraint.evaluate {constraint.constraint_name} does not require gradients.")
+                if not self.allow_nograd_constraints:
+                    for asset in assets:
+                        if isinstance(asset, torch.Tensor) and not asset.requires_grad:
+                            raise RuntimeError(f"Asset tensor {asset} does not require gradients.")
+                    if not constraint.evaluate(assets).requires_grad:
+                        raise RuntimeError(f"Constraint.evaluate {constraint.constraint_name} does not require gradients.")
                 try:
                     total_loss += constraint.evaluate(assets, device=self.device)
                 except Exception as e:
@@ -154,11 +163,70 @@ class GradSolver:
                     import pdb;pdb.set_trace()
             return total_loss
 
+        @profile_time
+        def calculate_reachability_loss():
+            """
+            Soft reachability constraint: encourage sufficient clearance between
+            furniture footprints so that a virtual robot (disc of radius robot_radius)
+            can move between them without collision.
+
+            We approximate clearance using center distances in the XY plane and
+            each asset's min(X, Y) footprint.
+            """
+            if not self.robot_radius or self.robot_radius <= 0:
+                return torch.tensor(0.0, dtype=torch.float32, device=self.device)
+
+            movable_assets = [
+                asset for asset in self.solver_assets.values()
+                if not self.is_fixture(asset.id) and not getattr(asset, "onCeiling", False)
+            ]
+            if len(movable_assets) < 2:
+                return torch.tensor(0.0, dtype=torch.float32, device=self.device)
+
+            reach_loss = torch.tensor(0.0, dtype=torch.float32, device=self.device)
+            required_clearance = 2.0 * float(self.robot_radius)
+
+            for i in range(len(movable_assets)):
+                asset_i = movable_assets[i]
+                for j in range(i + 1, len(movable_assets)):
+                    asset_j = movable_assets[j]
+
+                    # Skip stacked pairs treated separately
+                    if (asset_i.id, asset_j.id) in self.on_top_of_assets or (asset_j.id, asset_i.id) in self.on_top_of_assets:
+                        continue
+
+                    pos_i = asset_i.position[:2].to(self.device)
+                    # Detach the second asset to avoid double-counting gradients, consistent with distance_constraint
+                    pos_j = asset_j.position[:2].to(self.device).detach()
+
+                    size_i = asset_i.size
+                    size_j = asset_j.size
+                    # Fallbacks in case size is missing
+                    min_dim_i = min(size_i[0], size_i[1]) if size_i is not None else 0.0
+                    min_dim_j = min(size_j[0], size_j[1]) if size_j is not None else 0.0
+
+                    # Effective footprint "radius" of each asset in the corridor direction
+                    eff_i = float(min_dim_i) / 2.0
+                    eff_j = float(min_dim_j) / 2.0
+
+                    # Distance between centers in XY
+                    center_dist_sq = torch.sum((pos_i - pos_j) ** 2)
+                    effective_required = eff_i + eff_j + required_clearance
+                    required_dist_sq = effective_required ** 2
+
+                    # Penalize if actual distance is smaller than required distance
+                    violation = torch.relu(required_dist_sq - center_dist_sq)
+                    reach_loss = reach_loss + violation
+
+            # Scale to balance with other loss terms (was 0.01; increased to 5 for stronger reachability)
+            return reach_loss * 5.0
+
         overlap_loss = calculate_overlap_loss()
         existing_constraint_loss = evaluate_existing_constraints(existing_constraints)
         new_constraint_loss = evaluate_new_constraints(new_constraints)
+        reachability_loss = calculate_reachability_loss()
 
-        return overlap_loss, existing_constraint_loss, new_constraint_loss
+        return overlap_loss, existing_constraint_loss, new_constraint_loss, reachability_loss
     
     def annealing_objective_function(self, params, bounds, existing_constraints, new_constraints, params_dict):
         for instance_id, param_dict in params_dict.items():
@@ -166,9 +234,9 @@ class GradSolver:
             rotation_idx = param_dict["rotation"]
             self.solver_assets[instance_id].position.data = torch.tensor(params[position_idx:position_idx+3], dtype=torch.float32, device=self.device)
             self.solver_assets[instance_id].rotation.data = torch.tensor(params[rotation_idx:rotation_idx+2], dtype=torch.float32, device=self.device)
-        loss = self.calc_loss(existing_constraints, new_constraints)
-        # print(f"Loss: {loss.item()}")
-        return loss.item()
+        overlap_loss, existing_constraint_loss, new_constraint_loss, reachability_loss = self.calc_loss(existing_constraints, new_constraints)
+        total_loss = overlap_loss + existing_constraint_loss + new_constraint_loss + reachability_loss
+        return total_loss.item()
 
     def scipy_minimize_objective_function(self, params, bounds, existing_constraints, new_constraints, params_dict):
         for instance_id, param_dict in params_dict.items():
@@ -176,11 +244,11 @@ class GradSolver:
             rotation_idx = param_dict["rotation"]
             self.solver_assets[instance_id].position.data = torch.tensor(params[position_idx:position_idx+3], dtype=torch.float32, device=self.device)
             self.solver_assets[instance_id].rotation.data = torch.tensor(params[rotation_idx:rotation_idx+2], dtype=torch.float32, device=self.device)
-        loss = self.calc_loss(existing_constraints, new_constraints)
-        # print(f"Loss: {loss.item()}")
-        return loss.item()
+        overlap_loss, existing_constraint_loss, new_constraint_loss, reachability_loss = self.calc_loss(existing_constraints, new_constraints)
+        total_loss = overlap_loss + existing_constraint_loss + new_constraint_loss + reachability_loss
+        return total_loss.item()
 
-    def optimize(self, assets, existing_constraints, new_constraints, iterations=400, learning_rate=0.01, temp_dir=None, output_gif_path=None):
+    def optimize(self, assets, existing_constraints, new_constraints, iterations=400, learning_rate=0.01, temp_dir=None, output_gif_path=None, loss_dir=None, loss_filename_suffix="0", cleanup_iterations=40, cleanup_learning_rate=0.01):
         if len(assets) == 0:
             return {}
         if temp_dir: 
@@ -357,15 +425,24 @@ class GradSolver:
 
             frame_paths = []
             prev_loss = 1e6
-        
-            def is_better_solution(losses, best_losses):
-                best_overlap_loss, best_existing_constraint_loss, best_new_constraint_loss = [float(loss.item() if isinstance(loss, torch.Tensor) else loss) for loss in best_losses]
-                overlap_loss, existing_constraint_loss, new_constraint_loss = [float(loss.item() if isinstance(loss, torch.Tensor) else loss) for loss in losses]
-                if best_overlap_loss < 1e-3 and overlap_loss < 1e-3:
-                    return (existing_constraint_loss + new_constraint_loss) < (best_existing_constraint_loss + best_new_constraint_loss)
-                return (overlap_loss + existing_constraint_loss + new_constraint_loss) < (best_overlap_loss + best_existing_constraint_loss + best_new_constraint_loss)
+            loss_history = []
 
-            best_losses = (1e6, 1e6, 1e6)
+            def is_better_solution(losses, best_losses):
+                best_overlap_loss, best_existing_constraint_loss, best_new_constraint_loss, best_reachability_loss = [
+                    float(loss.item() if isinstance(loss, torch.Tensor) else loss) for loss in best_losses
+                ]
+                overlap_loss, existing_constraint_loss, new_constraint_loss, reachability_loss = [
+                    float(loss.item() if isinstance(loss, torch.Tensor) else loss) for loss in losses
+                ]
+                if best_overlap_loss < 1e-3 and overlap_loss < 1e-3:
+                    return (existing_constraint_loss + new_constraint_loss + reachability_loss) < (
+                        best_existing_constraint_loss + best_new_constraint_loss + best_reachability_loss
+                    )
+                return (overlap_loss + existing_constraint_loss + new_constraint_loss + reachability_loss) < (
+                    best_overlap_loss + best_existing_constraint_loss + best_new_constraint_loss + best_reachability_loss
+                )
+
+            best_losses = (1e6, 1e6, 1e6, 1e6)
             best_solution = collections.defaultdict(dict)
             for i in tqdm(range(iterations)):
                 ### visualization
@@ -389,10 +466,16 @@ class GradSolver:
 
                 optimizer.zero_grad()
 
-                overlap_loss, existing_constraint_loss, new_constraint_loss = self.calc_loss(existing_constraints, new_constraints)
+                overlap_loss, existing_constraint_loss, new_constraint_loss, reachability_loss = self.calc_loss(existing_constraints, new_constraints)
                 # if overlap loss is smaller than the best 
-                loss = overlap_loss + existing_constraint_loss + new_constraint_loss
-                # print(f"Iteration {i}, Total Loss: {loss.item()}, Overlap Loss: {overlap_loss.item() if isinstance(overlap_loss, torch.Tensor) else overlap_loss}, Existing Constraint Loss: {existing_constraint_loss.item() if isinstance(existing_constraint_loss, torch.Tensor) else existing_constraint_loss}, New Constraint Loss: {new_constraint_loss.item() if isinstance(new_constraint_loss, torch.Tensor) else new_constraint_loss}")
+                loss = overlap_loss + existing_constraint_loss + new_constraint_loss + reachability_loss
+                loss_history.append({
+                    "total": loss.item(),
+                    "overlap": overlap_loss.item() if isinstance(overlap_loss, torch.Tensor) else overlap_loss,
+                    "existing_constraint": existing_constraint_loss.item() if isinstance(existing_constraint_loss, torch.Tensor) else existing_constraint_loss,
+                    "new_constraint": new_constraint_loss.item() if isinstance(new_constraint_loss, torch.Tensor) else new_constraint_loss,
+                    "reachability": reachability_loss.item() if isinstance(reachability_loss, torch.Tensor) else reachability_loss,
+                })
                 loss *= 0.01
                 if not loss.requires_grad:
                     raise RuntimeError("Loss does not require gradients.")
@@ -401,12 +484,13 @@ class GradSolver:
                 # Apply gradients
                 optimizer.step()
 
-                if i%10 == 0 and is_better_solution((overlap_loss, existing_constraint_loss, new_constraint_loss), best_losses):
+                if i%10 == 0 and is_better_solution((overlap_loss, existing_constraint_loss, new_constraint_loss, reachability_loss), best_losses):
                     best_idx = i
                     best_losses = [
                         float(overlap_loss.item() if isinstance(overlap_loss, torch.Tensor) else overlap_loss),
                         float(existing_constraint_loss.item() if isinstance(existing_constraint_loss, torch.Tensor) else existing_constraint_loss),
-                        float(new_constraint_loss.item() if isinstance(new_constraint_loss, torch.Tensor) else new_constraint_loss)
+                        float(new_constraint_loss.item() if isinstance(new_constraint_loss, torch.Tensor) else new_constraint_loss),
+                        float(reachability_loss.item() if isinstance(reachability_loss, torch.Tensor) else reachability_loss),
                     ]
                     for instance_id in target_instance_ids:
                         asset = self.solver_assets[instance_id]
@@ -435,13 +519,32 @@ class GradSolver:
                     prev_loss = loss.item()
                     self.project_back_to_polygon(all_constraints)
                     scheduler.step()
-                    print(f"Iteration {i}, Total Loss: {loss.item()}, Overlap Loss: {overlap_loss.item() if isinstance(overlap_loss, torch.Tensor) else overlap_loss}, Existing Constraint Loss: {existing_constraint_loss.item() if isinstance(existing_constraint_loss, torch.Tensor) else existing_constraint_loss}, New Constraint Loss: {new_constraint_loss.item() if isinstance(new_constraint_loss, torch.Tensor) else new_constraint_loss}")
+                    loss_utils.print_loss_breakdown(
+                        i,
+                        loss.item(),
+                        overlap_loss.item() if isinstance(overlap_loss, torch.Tensor) else overlap_loss,
+                        existing_constraint_loss.item() if isinstance(existing_constraint_loss, torch.Tensor) else existing_constraint_loss,
+                        new_constraint_loss.item() if isinstance(new_constraint_loss, torch.Tensor) else new_constraint_loss,
+                        reachability=reachability_loss.item() if isinstance(reachability_loss, torch.Tensor) else reachability_loss,
+                    )
 
             if best_solution is not None:
                 print(f"Found better solution at iteration {best_idx}")
                 for instance_id in target_instance_ids:
                     self.solver_assets[instance_id].position.data = best_solution[instance_id]['position']
                     self.solver_assets[instance_id].rotation.data = best_solution[instance_id]['rotation']
+
+            # Post-optimization cleanup: re-optimize only problematic (e.g. overlapping) furniture
+            if cleanup_iterations > 0:
+                run_cleanup_step(
+                    self,
+                    existing_constraints,
+                    new_constraints,
+                    iterations=cleanup_iterations,
+                    learning_rate=cleanup_learning_rate,
+                    temp_dir=temp_dir,
+                    project_interval=10,
+                )
 
             if output_gif_path:
                 with imageio.get_writer(output_gif_path, mode='I', duration=0.5) as writer:
@@ -452,6 +555,10 @@ class GradSolver:
                 # remove all frames
                 #for frame_path in frame_paths:
                 #    os.remove(frame_path)
+
+            if loss_dir:
+                loss_utils.ensure_loss_dir(loss_dir)
+                loss_utils.plot_loss_curves(loss_history, loss_dir, loss_filename_suffix)
 
         self.project_back_to_polygon(all_constraints)
         ## save the intermediate states
