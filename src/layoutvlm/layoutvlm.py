@@ -551,6 +551,23 @@ class LayoutVLM:
             if len(all_frames) > 0:
                 imageio.mimsave(f"{self.save_dir}/final.gif", all_frames)
 
+        ### export full scene as GLB for online 3D viewers
+        try:
+            render_existing_scene(
+                results,
+                task,
+                save_dir=self.save_dir,
+                render_top_down=True,
+                add_hdri=True,
+                add_coordinate_mark=False,
+                annotate_object=False,
+                annotate_wall=False,
+                topdown_save_file=os.path.join(self.save_dir, "final_top_down.png"),
+                export_glb_path=os.path.join(self.save_dir, "final.glb"),
+            )
+        except Exception as e:
+            print(f"Final scene GLB export failed (layout still saved): {e}")
+
         return results
 
     def get_simple_program(grouped_assets, task):

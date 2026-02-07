@@ -185,7 +185,8 @@ def render_existing_scene(placed_assets, task, save_dir, add_hdri=True, topdown_
                           annotate_object=True, annotate_wall=True, render_top_down=True, adjust_top_down_angle=None, high_res=False, rotate_90=True,
                           apply_3dfront_texture=False, recenter_mesh=True, fov_multiplier=1.1, default_font_size=None,
                           combine_obj_components=False, side_view_phi=45, side_view_indices=[3], save_blend=False,
-                          add_object_bbox=False, ignore_asset_instance_idx=False, floor_material="Travertine008"):
+                          add_object_bbox=False, ignore_asset_instance_idx=False, floor_material="Travertine008",
+                          export_glb_path=None):
     """
     :param placed_assets: the set of assets that have been placed in the scene / to be rendered
     :param task: just for getting the boundary
@@ -356,6 +357,12 @@ def render_existing_scene(placed_assets, task, save_dir, add_hdri=True, topdown_
                 "category": asset["category"]
             }
             asset_count += 1
+
+    # Export full scene as GLB for online viewers (e.g. three.js, Babylon.js)
+    if export_glb_path:
+        os.makedirs(os.path.dirname(export_glb_path) or ".", exist_ok=True)
+        bpy.ops.export_scene.gltf(filepath=export_glb_path, export_format="GLB")
+        print(f"Scene exported to {export_glb_path}")
 
     if add_coordinate_mark:
         # asset-centric mode, add coordinate frame at the bottom left corner of the room
