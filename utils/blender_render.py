@@ -304,11 +304,13 @@ def render_existing_scene(placed_assets, task, save_dir, add_hdri=True, topdown_
         #elif "scale" in task["assets"][instance_id]:
         #    loaded.scale = placed_assets[instance_id]["scale"]
         # TODO (Weiyu): Why are we reading both from the `placed_assets` dict and the `task["assets"]` dict? Can we remove one?
+        # Add 180° to Z (yaw) so Blender render/GLB matches solver/GIF orientation convention.
         if isinstance(placed_assets[instance_id]["rotation"], float):
-            loaded.rotation_euler[-1] += np.deg2rad(placed_assets[instance_id]["rotation"])
+            loaded.rotation_euler[-1] += np.deg2rad(placed_assets[instance_id]["rotation"]) + math.pi
         else:
             for i in range(3):
                 loaded.rotation_euler[i] += np.deg2rad(placed_assets[instance_id]["rotation"][i])
+            loaded.rotation_euler[-1] += math.pi
         bpy.ops.object.transform_apply(location=True, rotation=True, scale=True)
         for i in range(3): assert loaded.rotation_euler[i] ==0 
         #bpy.ops.transform.rotate(value=math.radians(pose['rotation']['y']), orient_axis='Z')
