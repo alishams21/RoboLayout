@@ -2,7 +2,16 @@
 
 ## Overview
 
-This repository is a fork of [LayoutVLM](https://github.com/StanfordVL/layoutvlm) extending its functionality to ensure reachability in furnished spaces using walking-robot–based optimization constraint governed by a pairwise clearance rule , along with a post-optimization cleanup stage that selectively refine problematic furniture placements without rerunning the full optimization.  
+This repository extends [LayoutVLM](https://github.com/StanfordVL/layoutvlm) with agent-aware layout optimization for indoor scenes. It introduces explicit differentiable reachability constraints to ensure generated layouts are navigable and actionable by embodied agents with diverse physical capabilities (e.g., robots, humans, animals). The framework also includes a local refinement stage that selectively re-optimizes problematic object placements without rerunning full-scene optimization, improving stability and convergence while preserving semantic and physical plausibility.
+
+## Architecture
+RoboLayout comprises three main layers. Orchestration: The central orchestrator responsible for coordinating group-ings, rendering and other cognitive processes of the solver and sandbox. Sandbox: Translates constraints into feasible scene layouts. Solver: optimizer based on hard and soft constraints for spatial arrangements and refinement of the final optimized scene. Following shows the architecture diagram:
+
+<p align="center">
+  <img src="figures/architecture.png" alt="architecture diagram" width="50%">
+</p>
+
+
 
 ## Installation
 
@@ -42,7 +51,7 @@ python main.py \
 6. Loss curves to watch progress of optimization can be found in `results/loss`. Example:
 
 <p align="center">
-  <img src="figures/loss_curves_example.png" alt="Loss Curve" width="50%">
+  <img src="figures/loss_curves.png" alt="Loss Curve" width="50%">
 </p>
 
 
